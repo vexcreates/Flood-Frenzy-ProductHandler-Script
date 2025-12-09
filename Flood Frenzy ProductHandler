@@ -1,0 +1,240 @@
+--// Service references
+local Players = game:GetService("Players")
+local MarketplaceService = game:GetService("MarketplaceService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+local SoundService = game:GetService("SoundService")
+
+local Manager = require(ServerScriptService.PlayerData.Manager)
+
+-- Freeze and ragdoll sound effects
+local FreezeAllSound = SoundService:FindFirstChild("FreezeAllSound")
+local RagdollAllSound = SoundService:FindFirstChild("RagdollAllSound")
+
+--// Ensure ProductPurchased BindableEvent exists
+local ProductPurchased = ReplicatedStorage:FindFirstChild("ProductPurchased")
+if not ProductPurchased then
+	local be = Instance.new("BindableEvent")
+	be.Name = "ProductPurchased"
+	be.Parent = ReplicatedStorage
+	ProductPurchased = be
+end
+
+----------------------------------------------------------------
+-- COIN PRODUCT IDS & REWARD AMOUNTS
+----------------------------------------------------------------
+local REWARD_PRODUCT_ID  = 3459449973
+local REWARD_PRODUCT_ID2 = 3459450407
+local REWARD_PRODUCT_ID3 = 3459450611
+local REWARD_PRODUCT_ID4 = 3459450707
+
+local REWARD_AMOUNT  = 500
+local REWARD_AMOUNT2 = 1000
+local REWARD_AMOUNT3 = 2500
+local REWARD_AMOUNT4 = 5000
+
+----------------------------------------------------------------
+-- TROLL PRODUCT IDS
+----------------------------------------------------------------
+local PRODUCT_KILL_ALL      = 3460300434
+local PRODUCT_FREEZE_ALL    = 3460300786
+local PRODUCT_RAGDOLL_ALL   = 3457576342
+local PRODUCT_JUMPSCARE_ALL = 3460346466
+
+----------------------------------------------------------------
+-- REVIVE PRODUCT ID
+-- Handled in the RoundSystemHandler through ProductPurchased event
+----------------------------------------------------------------
+local REVIVE_PRODUCT_ID = 3463651461
+
+----------------------------------------------------------------
+-- Troll functionality helpers
+----------------------------------------------------------------
+local FREEZE_DURATION = 5
+
+local RemotesFolder = ReplicatedStorage:WaitForChild("Remotes")
+local JumpscareRemote = RemotesFolder:WaitForChild("TrollJumpscare", 5)
+local TrollAnnouncementRemote = RemotesFolder:WaitForChild("TrollAnnouncement", 5)
+
+-- Sends a troll announcement to all clients
+local function announceTroll(buyer, actionText)
+	if TrollAnnouncementRemote then
+		TrollAnnouncementRemote:FireAllClients(buyer.Name, actionText)
+	end
+end
+
+-- Runs a function for every player except the buyer
+local function forAllOtherPlayers(buyer, fn)
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= buyer then
+			fn(plr)
+		end
+	end
+end
+
+-- Kills every player except the buyer
+local function killAllOtherPlayers(buyer)
+	announceTroll(buyer, "Kill All")
+
+	forAllOtherPlayers(buyer, function(plr)
+		local char = plr.Character
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		if hum and hum.Health > 0 then
+			hum.Health = 0
+		end
+	end)
+end
+
+-- Freezes all other players for a temporary duration
+local function freezeAllOtherPlayers(buyer)
+	announceTroll(buyer, "Freeze All")
+
+	if FreezeAllSound then
+		FreezeAllSound:Play()
+	end
+
+	forAllOtherPlayers(buyer, function(plr)
+		local char = plr.Character
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+
+		if hum then
+			-- Save original movement settings once
+			if hum:GetAttribute("OrigWalkSpeed") == nil then
+				hum:SetAttribute("OrigWalkSpeed", hum.WalkSpeed)
+			end
+			if hum:GetAttribute("OrigJumpPower") == nil then
+				hum:SetAttribute("OrigJumpPower", hum.JumpPower)
+			end
+
+			hum.WalkSpeed = 0
+			hum.JumpPower = 0
+		end
+	end)
+
+	-- Automatically restore movement after freeze duration
+	task.delay(FREEZE_DURATION, function()
+		forAllOtherPlayers(buyer, function(plr)
+			local char = plr.Character
+			local hum = char and char:FindFirstChildOfClass("Humanoid")
+
+			if hum then
+				local ws = hum:GetAttribute("OrigWalkSpeed")
+				local jp = hum:GetAttribute("OrigJumpPower")
+				if ws then hum.WalkSpeed = ws end
+				if jp then hum.JumpPower = jp end
+			end
+		end)
+	end)
+end
+
+-- Applies a ragdoll effect to a character
+local function ragdollCharacter(char)
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	if hum then
+		hum:ChangeState(Enum.HumanoidStateType.Physics)
+	end
+end
+
+-- Ragdolls every player except the buyer
+local function ragdollAllOtherPlayers(buyer)
+	announceTroll(buyer, "Ragdoll All")
+
+	if RagdollAllSound then
+		RagdollAllSound:Play()
+	end
+
+	forAllOtherPlayers(buyer, function(plr)
+		local char = plr.Character
+		if char then
+			ragdollCharacter(char)
+		end
+	end)
+end
+
+-- Sends a jumpscare to every other player
+local function jumpscareAllOtherPlayers(buyer)
+	announceTroll(buyer, "Jumpscare All")
+
+	if not JumpscareRemote then return end
+
+	forAllOtherPlayers(buyer, function(plr)
+		JumpscareRemote:FireClient(plr)
+	end)
+end
+
+----------------------------------------------------------------
+-- Main handler for all developer product purchases
+----------------------------------------------------------------
+MarketplaceService.ProcessReceipt = function(receiptInfo)
+	local player = Players:GetPlayerByUserId(receiptInfo.PlayerId)
+	if not player then
+		return Enum.ProductPurchaseDecision.NotProcessedYet
+	end
+
+	-- Notify all systems that a product was purchased
+	ProductPurchased:Fire(receiptInfo.ProductId, player)
+
+	----------------------------------------------------------------
+	-- Revive product (logic handled externally)
+	----------------------------------------------------------------
+	if receiptInfo.ProductId == REVIVE_PRODUCT_ID then
+		-- RoundSystemHandler listens for this product and handles revive logic
+	end
+
+	----------------------------------------------------------------
+	-- Coin reward products
+	----------------------------------------------------------------
+	if receiptInfo.ProductId == REWARD_PRODUCT_ID then
+		local profile = Manager.GetProfileAsync(player, 5)
+		if not profile then return Enum.ProductPurchaseDecision.NotProcessedYet end
+
+		profile.Data.Coins = (profile.Data.Coins or 0) + REWARD_AMOUNT
+		player.leaderstats.Cash.Value = profile.Data.Coins
+		pcall(function() profile:Save() end)
+	end
+
+	if receiptInfo.ProductId == REWARD_PRODUCT_ID2 then
+		local profile = Manager.GetProfileAsync(player, 5)
+		if not profile then return Enum.ProductPurchaseDecision.NotProcessedYet end
+
+		profile.Data.Coins = (profile.Data.Coins or 0) + REWARD_AMOUNT2
+		player.leaderstats.Cash.Value = profile.Data.Coins
+		pcall(function() profile:Save() end)
+	end
+
+	if receiptInfo.ProductId == REWARD_PRODUCT_ID3 then
+		local profile = Manager.GetProfileAsync(player, 5)
+		if not profile then return Enum.ProductPurchaseDecision.NotProcessedYet end
+
+		profile.Data.Coins = (profile.Data.Coins or 0) + REWARD_AMOUNT3
+		player.leaderstats.Cash.Value = profile.Data.Coins
+		pcall(function() profile:Save() end)
+	end
+
+	if receiptInfo.ProductId == REWARD_PRODUCT_ID4 then
+		local profile = Manager.GetProfileAsync(player, 5)
+		if not profile then return Enum.ProductPurchaseDecision.NotProcessedYet end
+
+		profile.Data.Coins = (profile.Data.Coins or 0) + REWARD_AMOUNT4
+		player.leaderstats.Cash.Value = profile.Data.Coins
+		pcall(function() profile:Save() end)
+	end
+
+	----------------------------------------------------------------
+	-- Troll product effects
+	----------------------------------------------------------------
+	if receiptInfo.ProductId == PRODUCT_KILL_ALL then
+		killAllOtherPlayers(player)
+
+	elseif receiptInfo.ProductId == PRODUCT_FREEZE_ALL then
+		freezeAllOtherPlayers(player)
+
+	elseif receiptInfo.ProductId == PRODUCT_RAGDOLL_ALL then
+		ragdollAllOtherPlayers(player)
+
+	elseif receiptInfo.ProductId == PRODUCT_JUMPSCARE_ALL then
+		jumpscareAllOtherPlayers(player)
+	end
+
+	return Enum.ProductPurchaseDecision.PurchaseGranted
+end
