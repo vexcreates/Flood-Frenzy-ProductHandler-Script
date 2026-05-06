@@ -1,240 +1,344 @@
---// Service references
 local Players = game:GetService("Players")
-local MarketplaceService = game:GetService("MarketplaceService")
+local Workspace = game:GetService("Workspace")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local ServerScriptService = game:GetService("ServerScriptService")
-local SoundService = game:GetService("SoundService")
 
-local Manager = require(ServerScriptService.PlayerData.Manager)
+local LavaModule = require(ReplicatedStorage.Modules.LavaHandler)
+local PlayerData = require(ServerScriptService.PlayerData.Manager)
 
--- Freeze and ragdoll sound effects
-local FreezeAllSound = SoundService:FindFirstChild("FreezeAllSound")
-local RagdollAllSound = SoundService:FindFirstChild("RagdollAllSound")
+local CONFIG = {
+	MIN_PLAYERS = 2,
+	START_COUNTDOWN = 8,
+	ROUND_TIMEOUT = 110,
+	LAVA_HEIGHT = 160,
+	INTERMISSION = 20,
+	REVIVE_WINDOW = 15,
+	REVIVE_IMMUNITY = 8,
+	WIN_COINS = 100,
+	REVIVE_PRODUCT_ID = 3416412836,
+}
 
---// Ensure ProductPurchased BindableEvent exists
-local ProductPurchased = ReplicatedStorage:FindFirstChild("ProductPurchased")
-if not ProductPurchased then
-	local be = Instance.new("BindableEvent")
-	be.Name = "ProductPurchased"
-	be.Parent = ReplicatedStorage
-	ProductPurchased = be
-end
+local lobby = Workspace:WaitForChild("Lobby")
+local GearsFolder = ReplicatedStorage:FindFirstChild("Gears")
 
-----------------------------------------------------------------
--- COIN PRODUCT IDS & REWARD AMOUNTS
-----------------------------------------------------------------
-local REWARD_PRODUCT_ID  = 3459449973
-local REWARD_PRODUCT_ID2 = 3459450407
-local REWARD_PRODUCT_ID3 = 3459450611
-local REWARD_PRODUCT_ID4 = 3459450707
+local ProductPurchasedEvent: BindableEvent = ReplicatedStorage:WaitForChild("ProductPurchased")
+local RoundEndedEvent = Instance.new("BindableEvent")
+local RoundStateChanged = ReplicatedStorage.Remotes:FindFirstChild("RoundStateChanged")
 
-local REWARD_AMOUNT  = 500
-local REWARD_AMOUNT2 = 1000
-local REWARD_AMOUNT3 = 2500
-local REWARD_AMOUNT4 = 5000
+local HeightBarSet = ReplicatedStorage.Remotes:WaitForChild("HeightBar_Set")
+local HeightBarHide = ReplicatedStorage.Remotes:WaitForChild("HeightBar_Hide")
+local SoundPlayRemote = ReplicatedStorage.Remotes:WaitForChild("SoundPlay")
 
-----------------------------------------------------------------
--- TROLL PRODUCT IDS
-----------------------------------------------------------------
-local PRODUCT_KILL_ALL      = 3460300434
-local PRODUCT_FREEZE_ALL    = 3460300786
-local PRODUCT_RAGDOLL_ALL   = 3457576342
-local PRODUCT_JUMPSCARE_ALL = 3460346466
+local roundActive = false
+local currentTopY, currentBottomY = nil, nil
+local roundEnded = false
+local winner = nil
+local reviveCredits = {}
+local RoundPlayers = {}
 
-----------------------------------------------------------------
--- REVIVE PRODUCT ID
--- Handled in the RoundSystemHandler through ProductPurchased event
-----------------------------------------------------------------
-local REVIVE_PRODUCT_ID = 3463651461
-
-----------------------------------------------------------------
--- Troll functionality helpers
-----------------------------------------------------------------
-local FREEZE_DURATION = 5
-
-local RemotesFolder = ReplicatedStorage:WaitForChild("Remotes")
-local JumpscareRemote = RemotesFolder:WaitForChild("TrollJumpscare", 5)
-local TrollAnnouncementRemote = RemotesFolder:WaitForChild("TrollAnnouncement", 5)
-
--- Sends a troll announcement to all clients
-local function announceTroll(buyer, actionText)
-	if TrollAnnouncementRemote then
-		TrollAnnouncementRemote:FireAllClients(buyer.Name, actionText)
+ProductPurchasedEvent.Event:Connect(function(prod, plr)
+	if prod == CONFIG.REVIVE_PRODUCT_ID then
+		reviveCredits[plr] = (reviveCredits[plr] or 0) + 1
 	end
-end
+end)
 
--- Runs a function for every player except the buyer
-local function forAllOtherPlayers(buyer, fn)
-	for _, plr in ipairs(Players:GetPlayers()) do
-		if plr ~= buyer then
-			fn(plr)
-		end
+Players.PlayerAdded:Connect(function(plr)
+	if roundActive and currentTopY and currentBottomY then
+		HeightBarSet:FireClient(plr, currentTopY, currentBottomY)
 	end
-end
+end)
 
--- Kills every player except the buyer
-local function killAllOtherPlayers(buyer)
-	announceTroll(buyer, "Kill All")
+Players.PlayerRemoving:Connect(function(plr)
+	reviveCredits[plr] = nil
+end)
 
-	forAllOtherPlayers(buyer, function(plr)
-		local char = plr.Character
-		local hum = char and char:FindFirstChildOfClass("Humanoid")
-		if hum and hum.Health > 0 then
-			hum.Health = 0
-		end
+local function safeFireClient(remote, player, ...)
+	local args = table.pack(...)
+	pcall(function()
+		remote:FireClient(player, table.unpack(args, 1, args.n))
 	end)
 end
 
--- Freezes all other players for a temporary duration
-local function freezeAllOtherPlayers(buyer)
-	announceTroll(buyer, "Freeze All")
+local function playLobbyMusic()
+	for _, player in ipairs(Players:GetPlayers()) do
+		safeFireClient(SoundPlayRemote, player, {
+			action = "stop",
+			name = "GameAudio",
+			fadeDuration = 3,
+		})
+		safeFireClient(SoundPlayRemote, player, {
+			action = "play",
+			sound = "LobbySoundtrack",
+			name = "LobbySoundtrack",
+			fadein = true,
+			targetVolume = 0.5,
+		})
+	end
+end
 
-	if FreezeAllSound then
-		FreezeAllSound:Play()
+local function clearTools(player)
+	if player.Backpack then
+		for _, tool in ipairs(player.Backpack:GetChildren()) do
+			if tool:IsA("Tool") then tool:Destroy() end
+		end
+	end
+	if player.Character then
+		for _, tool in ipairs(player.Character:GetChildren()) do
+			if tool:IsA("Tool") then tool:Destroy() end
+		end
+	end
+end
+
+local function equipPlayerGears(player)
+	local EquippedItem = player:FindFirstChild("EquippedItem")
+	if EquippedItem and GearsFolder then
+		local gearTemplate = GearsFolder:FindFirstChild(EquippedItem.Value)
+		if gearTemplate then
+			local BoughtItem = gearTemplate:Clone()
+			BoughtItem.Parent = player:WaitForChild("Backpack")
+		end
 	end
 
-	forAllOtherPlayers(buyer, function(plr)
-		local char = plr.Character
-		local hum = char and char:FindFirstChildOfClass("Humanoid")
-
-		if hum then
-			-- Save original movement settings once
-			if hum:GetAttribute("OrigWalkSpeed") == nil then
-				hum:SetAttribute("OrigWalkSpeed", hum.WalkSpeed)
+	local gpFolder = player:FindFirstChild("GamePassItems")
+	local gpGears = ReplicatedStorage:FindFirstChild("GamepassGears")
+	if gpFolder and gpGears then
+		for _, gearVal in ipairs(gpFolder:GetChildren()) do
+			local template = gpGears:FindFirstChild(gearVal.Name)
+			if template then
+				local BoughtItem = template:Clone()
+				BoughtItem.Parent = player:WaitForChild("Backpack")
 			end
-			if hum:GetAttribute("OrigJumpPower") == nil then
-				hum:SetAttribute("OrigJumpPower", hum.JumpPower)
+		end
+	end
+end
+
+local function runRound()
+	roundEnded = false
+	winner = nil
+	table.clear(RoundPlayers)
+	LavaModule.UpdateUI_Players("Round is starting soon...")
+
+	while #Players:GetPlayers() < CONFIG.MIN_PLAYERS do
+		local count = #Players:GetPlayers()
+		LavaModule.UpdateUI_Players("Waiting for players... ("..count.."/"..CONFIG.MIN_PLAYERS..")")
+		task.wait(2)
+	end
+
+	LavaModule.UpdateUI_Players("Go to the shop and buy gears!")
+
+	if Workspace:FindFirstChild("Map") then Workspace.Map:Destroy() end
+
+	local newMap = LavaModule.SpawnRandomMap()
+	if not newMap then
+		warn("No maps available!")
+		LavaModule.UpdateUI_timer("No maps available, retrying...")
+		task.wait(5)
+		return
+	end
+
+	local heightPart = newMap:FindFirstChild("HeightBar")
+	if heightPart and heightPart:IsA("BasePart") then
+		currentTopY = heightPart.Position.Y + heightPart.Size.Y / 2
+		currentBottomY = heightPart.Position.Y - heightPart.Size.Y / 2
+	else
+		currentTopY, currentBottomY = 50, 0
+	end
+
+	local lobbySpawn = lobby:FindFirstChild("SpawnLocation")
+	local specialParts = newMap:WaitForChild("SpecialParts")
+	local targetPart = specialParts:WaitForChild("Ceiling")
+	local winPart = specialParts:WaitForChild("WinButton")
+
+	for i = CONFIG.START_COUNTDOWN, 1, -1 do
+		LavaModule.UpdateUI_timer("Round starts in "..i.."...")
+		task.wait(1)
+	end
+
+	roundActive = true
+	RoundStateChanged:FireAllClients(true)
+	HeightBarSet:FireAllClients(currentTopY, currentBottomY)
+
+	local spawnParts = newMap:FindFirstChild("Spawns") and newMap.Spawns:FindFirstChild("SPAWN")
+	for _, player in ipairs(Players:GetPlayers()) do
+		table.insert(RoundPlayers, player)
+		if spawnParts then LavaModule.TeleportPlayerTo(player, spawnParts) end
+		equipPlayerGears(player)
+	end
+
+	local alivePlayers = {}
+	local diedConnections = {}
+	local connections = {}
+
+	local function spawnPlr(splr, respawnPos)
+		local existCon = diedConnections[splr]
+		if existCon then existCon:Disconnect() end
+
+		local character = splr.Character or splr.CharacterAdded:Wait()
+		local humanoid = character:FindFirstChild("Humanoid")
+		if not humanoid then return end
+
+		if respawnPos then
+			LavaModule.TeleportPlayerTo(splr, CFrame.new(respawnPos), true)
+		end
+		alivePlayers[splr] = true
+
+		diedConnections[splr] = humanoid.Died:Connect(function()
+			alivePlayers[splr] = nil
+			local aliveCount, lastAlivePlayer = 0, nil
+			for p, _ in pairs(alivePlayers) do
+				aliveCount += 1
+				lastAlivePlayer = p
 			end
 
-			hum.WalkSpeed = 0
-			hum.JumpPower = 0
+			if aliveCount <= 1 and not roundEnded then
+				roundEnded = true
+				winner = (aliveCount == 1) and lastAlivePlayer or nil
+				RoundEndedEvent:Fire()
+				return
+			end
+
+			task.spawn(function()
+				local lastPos
+				local hrp = character:FindFirstChild("HumanoidRootPart")
+				if hrp then lastPos = hrp.Position end
+
+				local start = tick()
+				while tick() - start <= CONFIG.REVIVE_WINDOW do
+					if roundEnded then return end
+					if reviveCredits[splr] and reviveCredits[splr] >= 1 and lastPos then
+						reviveCredits[splr] -= 1
+						splr:SetAttribute("Immune", tick() + CONFIG.REVIVE_IMMUNITY)
+						spawnPlr(splr, lastPos)
+						return
+					end
+					task.wait(1)
+				end
+			end)
+		end)
+	end
+
+	local leftConn = Players.PlayerRemoving:Connect(function(plr)
+		if alivePlayers[plr] then
+			alivePlayers[plr] = nil
+			local aliveCount, lastAlivePlayer = 0, nil
+			for p, _ in pairs(alivePlayers) do
+				aliveCount += 1
+				lastAlivePlayer = p
+			end
+			if aliveCount <= 1 and not roundEnded then
+				roundEnded = true
+				winner = (aliveCount == 1) and lastAlivePlayer or nil
+				RoundEndedEvent:Fire()
+			end
+		end
+	end)
+	table.insert(connections, leftConn)
+
+	for _, player in ipairs(RoundPlayers) do spawnPlr(player) end
+
+	task.spawn(function()
+		local startTime = tick()
+		while tick() - startTime < CONFIG.ROUND_TIMEOUT do
+			if roundEnded then return end
+			task.wait(1)
+		end
+		if not roundEnded then
+			roundEnded = true
+			winner = nil
+			pcall(function() ReplicatedStorage:SetAttribute("LavaRise", false) end)
+			RoundEndedEvent:Fire()
 		end
 	end)
 
-	-- Automatically restore movement after freeze duration
-	task.delay(FREEZE_DURATION, function()
-		forAllOtherPlayers(buyer, function(plr)
-			local char = plr.Character
-			local hum = char and char:FindFirstChildOfClass("Humanoid")
-
-			if hum then
-				local ws = hum:GetAttribute("OrigWalkSpeed")
-				local jp = hum:GetAttribute("OrigJumpPower")
-				if ws then hum.WalkSpeed = ws end
-				if jp then hum.JumpPower = jp end
+	if winPart then
+		local touchConn = winPart.Touched:Connect(function(hit)
+			local character = hit.Parent
+			if not character then return end
+			local player = Players:GetPlayerFromCharacter(character)
+			local humanoid = character:FindFirstChild("Humanoid")
+			if player and humanoid and humanoid.Health > 0 and not roundEnded then
+				roundEnded = true
+				winner = player
+				RoundEndedEvent:Fire()
 			end
 		end)
-	end)
-end
-
--- Applies a ragdoll effect to a character
-local function ragdollCharacter(char)
-	local hum = char:FindFirstChildOfClass("Humanoid")
-	if hum then
-		hum:ChangeState(Enum.HumanoidStateType.Physics)
-	end
-end
-
--- Ragdolls every player except the buyer
-local function ragdollAllOtherPlayers(buyer)
-	announceTroll(buyer, "Ragdoll All")
-
-	if RagdollAllSound then
-		RagdollAllSound:Play()
+		table.insert(connections, touchConn)
 	end
 
-	forAllOtherPlayers(buyer, function(plr)
-		local char = plr.Character
-		if char then
-			ragdollCharacter(char)
+	pcall(function() ReplicatedStorage:SetAttribute("LavaRise", true) end)
+
+	task.spawn(function()
+		LavaModule.StartGrowing(targetPart, CONFIG.LAVA_HEIGHT)
+		if not roundEnded then
+			roundEnded = true
+			RoundEndedEvent:Fire()
 		end
 	end)
+
+	RoundEndedEvent.Event:Wait()
+
+	roundActive = false
+	RoundStateChanged:FireAllClients(false)
+	currentTopY, currentBottomY = nil, nil
+	HeightBarHide:FireAllClients()
+
+	pcall(function() ReplicatedStorage:SetAttribute("LavaRise", false) end)
+	pcall(function() LavaModule.ClearRoundState() end)
+
+	if Workspace:FindFirstChild("lava") then
+		pcall(function() Workspace.lava:Destroy() end)
+	end
+
+	for splr, conn in pairs(diedConnections) do
+		if conn then pcall(function() conn:Disconnect() end) end
+		diedConnections[splr] = nil
+	end
+	for _, conn in ipairs(connections) do
+		if conn then pcall(function() conn:Disconnect() end) end
+	end
+	for k in pairs(alivePlayers) do alivePlayers[k] = nil end
+
+	if winner and winner.Parent then
+		playLobbyMusic()
+		LavaModule.UpdateUI_timer(winner.Name.." WON!")
+		ReplicatedStorage.Remotes.WinnerUI:FireAllClients(winner.Name, CONFIG.WIN_COINS)
+		PlayerData.AdjustCoins(winner, CONFIG.WIN_COINS)
+		PlayerData.AdjustWins(winner, 1)
+	else
+		LavaModule.UpdateUI_timer("No winner this round!")
+		ReplicatedStorage.Remotes.WinnerUI:FireAllClients("", 0)
+	end
+
+	task.wait(5)
+	ReplicatedStorage.Remotes.WinnerUI:FireAllClients("__HIDE__", 0)
+
+	for _, player in ipairs(Players:GetPlayers()) do
+		local hum = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+		if hum then hum.Health = hum.MaxHealth end
+	end
+
+	LavaModule.TeleportAllTo(lobbySpawn)
+	for _, player in ipairs(RoundPlayers) do
+		if player.Parent then clearTools(player) end
+	end
+
+	if Workspace:FindFirstChild("lava") then Workspace.lava:Destroy() end
+
+	LavaModule.UpdateUI_Players("Round is starting soon...")
+	for i = CONFIG.INTERMISSION, 1, -1 do
+		LavaModule.UpdateUI_timer("Intermission: "..i)
+		task.wait(1)
+	end
 end
 
--- Sends a jumpscare to every other player
-local function jumpscareAllOtherPlayers(buyer)
-	announceTroll(buyer, "Jumpscare All")
-
-	if not JumpscareRemote then return end
-
-	forAllOtherPlayers(buyer, function(plr)
-		JumpscareRemote:FireClient(plr)
-	end)
-end
-
-----------------------------------------------------------------
--- Main handler for all developer product purchases
-----------------------------------------------------------------
-MarketplaceService.ProcessReceipt = function(receiptInfo)
-	local player = Players:GetPlayerByUserId(receiptInfo.PlayerId)
-	if not player then
-		return Enum.ProductPurchaseDecision.NotProcessedYet
+while true do
+	local ok, err = pcall(runRound)
+	if not ok then
+		warn("Round errored:", err)
+		roundActive = false
+		pcall(function() RoundStateChanged:FireAllClients(false) end)
+		pcall(function() HeightBarHide:FireAllClients() end)
+		pcall(function() ReplicatedStorage:SetAttribute("LavaRise", false) end)
+		task.wait(5)
 	end
-
-	-- Notify all systems that a product was purchased
-	ProductPurchased:Fire(receiptInfo.ProductId, player)
-
-	----------------------------------------------------------------
-	-- Revive product (logic handled externally)
-	----------------------------------------------------------------
-	if receiptInfo.ProductId == REVIVE_PRODUCT_ID then
-		-- RoundSystemHandler listens for this product and handles revive logic
-	end
-
-	----------------------------------------------------------------
-	-- Coin reward products
-	----------------------------------------------------------------
-	if receiptInfo.ProductId == REWARD_PRODUCT_ID then
-		local profile = Manager.GetProfileAsync(player, 5)
-		if not profile then return Enum.ProductPurchaseDecision.NotProcessedYet end
-
-		profile.Data.Coins = (profile.Data.Coins or 0) + REWARD_AMOUNT
-		player.leaderstats.Cash.Value = profile.Data.Coins
-		pcall(function() profile:Save() end)
-	end
-
-	if receiptInfo.ProductId == REWARD_PRODUCT_ID2 then
-		local profile = Manager.GetProfileAsync(player, 5)
-		if not profile then return Enum.ProductPurchaseDecision.NotProcessedYet end
-
-		profile.Data.Coins = (profile.Data.Coins or 0) + REWARD_AMOUNT2
-		player.leaderstats.Cash.Value = profile.Data.Coins
-		pcall(function() profile:Save() end)
-	end
-
-	if receiptInfo.ProductId == REWARD_PRODUCT_ID3 then
-		local profile = Manager.GetProfileAsync(player, 5)
-		if not profile then return Enum.ProductPurchaseDecision.NotProcessedYet end
-
-		profile.Data.Coins = (profile.Data.Coins or 0) + REWARD_AMOUNT3
-		player.leaderstats.Cash.Value = profile.Data.Coins
-		pcall(function() profile:Save() end)
-	end
-
-	if receiptInfo.ProductId == REWARD_PRODUCT_ID4 then
-		local profile = Manager.GetProfileAsync(player, 5)
-		if not profile then return Enum.ProductPurchaseDecision.NotProcessedYet end
-
-		profile.Data.Coins = (profile.Data.Coins or 0) + REWARD_AMOUNT4
-		player.leaderstats.Cash.Value = profile.Data.Coins
-		pcall(function() profile:Save() end)
-	end
-
-	----------------------------------------------------------------
-	-- Troll product effects
-	----------------------------------------------------------------
-	if receiptInfo.ProductId == PRODUCT_KILL_ALL then
-		killAllOtherPlayers(player)
-
-	elseif receiptInfo.ProductId == PRODUCT_FREEZE_ALL then
-		freezeAllOtherPlayers(player)
-
-	elseif receiptInfo.ProductId == PRODUCT_RAGDOLL_ALL then
-		ragdollAllOtherPlayers(player)
-
-	elseif receiptInfo.ProductId == PRODUCT_JUMPSCARE_ALL then
-		jumpscareAllOtherPlayers(player)
-	end
-
-	return Enum.ProductPurchaseDecision.PurchaseGranted
 end
